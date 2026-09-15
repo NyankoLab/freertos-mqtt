@@ -66,21 +66,12 @@ typedef struct mqtt_state_t
 
 } mqtt_state_t;
 
-typedef struct outbound_message {
-  STAILQ_ENTRY(outbound_message) next;
-  int message_type;
-  int message_length;
-  char message_data[1];
-} outbound_message_t;
-STAILQ_HEAD(outbound_message_list_t, outbound_message);
-
 void mqtt_process(void* arg);
 
 TaskHandle_t mqtt_internal IRAM_BSS_ATTR;
 TaskHandle_t mqtt_external IRAM_BSS_ATTR;
 mqtt_state_t mqtt_state;
 int mqtt_flags IRAM_BSS_ATTR;
-struct outbound_message_list_t* mqtt_outbound_message_list IRAM_BSS_ATTR;
 
 
 /*********************************************************************
@@ -96,9 +87,6 @@ void mqtt_init(uint8_t* in_buffer, int in_buffer_length, uint8_t* out_buffer, in
   mqtt_state.in_buffer_length = in_buffer_length;
   mqtt_state.out_buffer = out_buffer;
   mqtt_state.out_buffer_length = out_buffer_length;
-
-  mqtt_outbound_message_list = calloc(1, sizeof(struct outbound_message_list_t));
-  STAILQ_INIT(mqtt_outbound_message_list);
 }
 
 // Connect to the specified server
@@ -113,7 +101,7 @@ int mqtt_connect(ip_addr_t* address, uint16_t port, int auto_reconnect, mqtt_con
   mqtt_state.connect_info = info;
   mqtt_state.calling_process = calling_process;
 
-  xTaskCreate(mqtt_process, "mqtt", 3072, NULL, 5, &mqtt_internal);
+  xTaskCreate(mqtt_process, "mqtt", 3072, NULL, tskIDLE_PRIORITY, &mqtt_internal);
   mqtt_external = NULL;
 
   return 0;
@@ -146,11 +134,7 @@ int mqtt_subscribe(const char* topic)
   mqtt_message_t* outbound_message = mqtt_msg_subscribe(&mqtt_state.mqtt_connection,
                                                         topic, 0,
                                                         &mqtt_state.pending_msg_id);
-  outbound_message_t* outbound = calloc(1, sizeof(outbound_message_t) + outbound_message->length - 1);
-  outbound->message_type = MQTT_MSG_TYPE_SUBSCRIBE;
-  outbound->message_length = outbound_message->length;
-  memcpy(outbound->message_data, outbound_message->data, outbound_message->length);
-  STAILQ_INSERT_TAIL(mqtt_outbound_message_list, outbound, next);
+  lwip_send(mqtt_state.tcp_connection, outbound_message->data, outbound_message->length, 0);
 
   return 0;
 }
@@ -163,11 +147,7 @@ int mqtt_unsubscribe(const char* topic)
   ESP_LOGD(TAG, "sending unsubscribe");
   mqtt_message_t* outbound_message = mqtt_msg_unsubscribe(&mqtt_state.mqtt_connection, topic,
                                                           &mqtt_state.pending_msg_id);
-  outbound_message_t* outbound = calloc(1, sizeof(outbound_message_t) + outbound_message->length - 1);
-  outbound->message_type = MQTT_MSG_TYPE_UNSUBSCRIBE;
-  outbound->message_length = outbound_message->length;
-  memcpy(outbound->message_data, outbound_message->data, outbound_message->length);
-  STAILQ_INSERT_TAIL(mqtt_outbound_message_list, outbound, next);
+  lwip_send(mqtt_state.tcp_connection, outbound_message->data, outbound_message->length, 0);
 
   return 0;
 }
@@ -183,11 +163,7 @@ int mqtt_publish_with_length(const char* topic, const char* data, int data_lengt
                                                       topic, data, data_length,
                                                       qos, retain,
                                                       &mqtt_state.pending_msg_id);
-  outbound_message_t* outbound = calloc(1, sizeof(outbound_message_t) + outbound_message->length - 1);
-  outbound->message_type = MQTT_MSG_TYPE_PUBLISH;
-  outbound->message_length = outbound_message->length;
-  memcpy(outbound->message_data, outbound_message->data, outbound_message->length);
-  STAILQ_INSERT_TAIL(mqtt_outbound_message_list, outbound, next);
+  lwip_send(mqtt_state.tcp_connection, outbound_message->data, outbound_message->length, 0);
 
   return 0;
 }
@@ -277,9 +253,7 @@ static void handle_mqtt_connection(mqtt_state_t* state)
       char c;
       if(state->outbound_message != NULL)
         break;
-      if(STAILQ_FIRST(mqtt_outbound_message_list))
-        break;
-      if(lwip_recv(state->tcp_connection, &c, sizeof(c), MSG_PEEK | MSG_DONTWAIT) != -1)
+      if(lwip_recv(state->tcp_connection, &c, sizeof(c), MSG_PEEK) != -1)
         break;
       if(errno != EAGAIN)
         return;
@@ -296,16 +270,6 @@ static void handle_mqtt_connection(mqtt_state_t* state)
       if(state->pending_msg_type == MQTT_MSG_TYPE_PUBLISH && state->pending_msg_id == 0)
         complete_pending(state, MQTT_EVENT_TYPE_PUBLISHED);
 
-      continue;
-    }
-
-    if(STAILQ_FIRST(mqtt_outbound_message_list))
-    {
-      outbound_message_t* outbound = STAILQ_FIRST(mqtt_outbound_message_list);
-      STAILQ_REMOVE_HEAD(mqtt_outbound_message_list, next);
-
-      lwip_send(state->tcp_connection, outbound->message_data, outbound->message_length, 0);
-      free(outbound);
       continue;
     }
 
@@ -411,7 +375,7 @@ void mqtt_process(void* arg)
     if(mqtt_state.tcp_connection >= 0)
     {
       struct sockaddr_in sockaddr = {};
-      sockaddr.sin_len = sizeof(sockaddr);
+      sockaddr.sin_len = sizeof(struct sockaddr_in);
       sockaddr.sin_family = AF_INET;
       sockaddr.sin_port = htons(mqtt_state.port);
       sockaddr.sin_addr.s_addr = mqtt_state.address.u_addr.ip4.addr;
